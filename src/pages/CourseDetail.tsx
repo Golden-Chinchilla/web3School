@@ -24,7 +24,7 @@ export const CourseDetail = () => {
     });
 
     if (!id) return <div className="p-6 text-red-500">无效课程</div>;
-    const owned = (balance ?? 0n) > 0n;
+    const owned = ((balance as bigint | undefined) ?? 0n) > 0n;
     const videoUrl = videos[id];
 
     return (
