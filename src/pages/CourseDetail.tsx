@@ -1,65 +1,112 @@
-// src/pages/CourseDetail.tsx
-import { useParams, Link } from "react-router";
-import { useAccount, useReadContract } from "wagmi";
-import { CONTRACTS } from "../lib/contracts";
-import { useState } from "react";
+import { useParams } from 'react-router';
+import { useEffect, useMemo, useState } from 'react';
+import type { CourseMeta, Address } from '../lib/types';
+import { useAccount } from 'wagmi';
+import { useEthersSigner, makeContract } from '../lib/ethers-adapter';
+import { ERC1155_MIN_ABI } from '../lib/abi-min';
+import { CONTRACTS } from '../lib/contracts';
 
-const videos: Record<string, string> = {
-    "1": "https://www.w3schools.com/html/mov_bbb.mp4",
-    "2": "https://www.w3schools.com/html/movie.mp4",
-    "3": "https://www.w3schools.com/html/mov_bbb.mp4",
-};
+async function fetchCourse(id: number): Promise<CourseMeta | null> {
+    const r = await fetch(`/api/courses/${id}`);
+    if (!r.ok) return null;
+    return (await r.json()) as CourseMeta;
+}
 
-export const CourseDetail = () => {
+function buildPlayMessage(addr: Address, courseId: number) {
+    const nonce = crypto.randomUUID();
+    const ts = Date.now();
+    // 与后端约定的多行模板（严格！）
+    return `web3u:play
+addr=${addr}
+courseId=${courseId}
+ts=${ts}
+nonce=${nonce}`;
+}
+
+export function CourseDetail() {
     const { id } = useParams();
-    const { address, isConnected } = useAccount();
-    const [done, setDone] = useState(false);
+    const courseId = Number(id);
+    const { address } = useAccount();
+    const { getSigner, ready } = useEthersSigner();
 
-    const { data: balance } = useReadContract({
-        address: CONTRACTS.CoursePass1155.address,
-        abi: CONTRACTS.CoursePass1155.abi,
-        functionName: "balanceOf",
-        args: address && id ? [address, BigInt(id)] : undefined,
-        query: { enabled: !!address && !!id },
-    });
+    const [meta, setMeta] = useState<CourseMeta | null>(null);
+    const [hasPass, setHasPass] = useState<boolean | null>(null);
+    const [videoSrc, setVideoSrc] = useState<string>('');
+    const [busy, setBusy] = useState(false);
 
-    if (!id) return <div className="p-6 text-red-500">无效课程</div>;
-    const owned = ((balance as bigint | undefined) ?? 0n) > 0n;
-    const videoUrl = videos[id];
+    useEffect(() => { (async () => setMeta(await fetchCourse(courseId)))(); }, [courseId]);
+
+    // 判权：ERC1155 balanceOf(address, id) > 0
+    useEffect(() => {
+        (async () => {
+            if (!address || !ready) { setHasPass(null); return; }
+            const signer = await getSigner();
+            const provider = signer.provider!;
+            const pass = makeContract<any>(CONTRACTS.CoursePass1155.address, ERC1155_MIN_ABI, provider);
+            const bal: bigint = await pass.balanceOf(address, courseId);
+            setHasPass(bal > 0n);
+        })();
+    }, [address, ready, courseId]);
+
+    const onPlay = async () => {
+        if (!address || !ready || !meta) return;
+        setBusy(true);
+        try {
+            const signer = await getSigner();
+            const message = buildPlayMessage(address, courseId);
+            const signature = await signer.signMessage(message); // ethers 前端签名
+
+            const resp = await fetch('/api/auth/issue-play-token', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ courseId, address, message, signature }),
+            });
+            const j = await resp.json();
+            if (!resp.ok) throw new Error(j?.error || 'ISSUE_TOKEN_FAILED');
+
+            const src = `/api/play?courseId=${courseId}&token=${encodeURIComponent(j.token)}`;
+            setVideoSrc(src);
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    if (!meta) return <div className="text-zinc-400">Loading…</div>;
 
     return (
-        <div className="max-w-3xl mx-auto p-6 bg-white rounded-lg shadow">
-            <h1 className="text-2xl font-bold mb-3">课程 #{id}</h1>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2">
+                <h1 className="text-3xl font-extrabold">{meta.title}</h1>
+                <p className="text-zinc-300 mt-4">{meta.description}</p>
 
-            {!isConnected && (
-                <div className="mb-4 text-sm text-gray-600">
-                    你还未连接钱包，请先右上角连接。
-                </div>
-            )}
-
-            {!owned ? (
-                <div className="bg-yellow-50 border border-yellow-200 p-4 rounded">
-                    你还没有该课程的通行证。请先
-                    <Link to={`/buy/${id}`} className="text-blue-600 underline ml-1">
-                        购买
-                    </Link>
-                    。
-                </div>
-            ) : (
-                <>
-                    <video
-                        key={id}
-                        className="w-full rounded border"
-                        controls
-                        onEnded={() => setDone(true)}
-                    >
-                        <source src={videoUrl} type="video/mp4" />
-                    </video>
-                    {done && (
-                        <p className="mt-3 text-green-600 font-medium">✅ 已完成观看</p>
+                <div className="mt-6 rounded-2xl overflow-hidden border border-white/10 bg-black/30 aspect-video">
+                    {videoSrc ? (
+                        <video src={videoSrc} controls className="w-full h-full" />
+                    ) : (
+                        <div className="h-full w-full flex items-center justify-center text-zinc-400">
+                            {hasPass === false ? '购买后可观看' : '点击下方按钮开始播放'}
+                        </div>
                     )}
-                </>
-            )}
+                </div>
+
+                <div className="mt-4">
+                    <button
+                        disabled={!hasPass || busy}
+                        onClick={onPlay}
+                        className="px-4 py-2 rounded-xl bg-indigo-500/90 hover:bg-indigo-400 text-white disabled:opacity-50"
+                    >
+                        {busy ? 'Authorizing…' : hasPass ? 'Play' : 'No Access'}
+                    </button>
+                </div>
+            </div>
+
+            <aside className="space-y-4">
+                <div className="rounded-2xl border border-white/10 p-4">
+                    <div className="text-sm text-zinc-400">Course #{meta.courseId}</div>
+                    <div className="mt-2 text-zinc-200 text-sm">Author: {meta.author}</div>
+                    <div className="mt-1 text-zinc-200 text-sm">Token: {meta.tokenAddress}</div>
+                </div>
+            </aside>
         </div>
     );
 }
