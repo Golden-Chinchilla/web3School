@@ -1,137 +1,150 @@
-import { useEffect, useMemo, useState } from 'react';
-import type { CourseMeta, Address } from '../lib/types';
-import { useAccount } from 'wagmi';
-import { makeContract, useEthersSigner, weiToToken } from '../lib/ethers-adapter';
-import { ERC20_MIN_ABI } from '../lib/abi-min';
-import { CONTRACTS } from '../lib/contracts';
-import { formatUnits } from 'ethers';
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router";
+import { useAccount, useWalletClient } from "wagmi";
+import { BrowserProvider, Contract, formatUnits } from "ethers";
+import { CONTRACTS } from "../lib/contracts";
 
-type ItemView = CourseMeta & {
-    decimals?: number;
-    symbol?: string;
-    allowance?: bigint;
-    priceWei: bigint; // parsed from meta.price
+type Address = `0x${string}`;
+type CourseMeta = {
+    courseId: number;
+    title: string;
+    description: string;
+    videoUrl: string;
+    author: Address;
+    price: string;           // wei
+    tokenAddress: Address;
+    createdAt: number;
+    status: "active" | "inactive";
 };
 
-async function fetchCourses(): Promise<CourseMeta[]> {
-    const r = await fetch('/api/courses');
-    const j = await r.json();
-    return j.items as CourseMeta[];
-}
+const API_BASE = import.meta.env.VITE_WORKER_BASE_URL ?? "";
 
 export function BuyCourse() {
     const { address } = useAccount();
-    const { getSigner, ready } = useEthersSigner();
+    const { data: walletClient } = useWalletClient();
+    const navigate = useNavigate();
 
-    const [items, setItems] = useState<ItemView[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [busyId, setBusyId] = useState<number | null>(null);
+    const [courses, setCourses] = useState<CourseMeta[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [txStatus, setTxStatus] = useState<string | null>(null);
 
     useEffect(() => {
         (async () => {
             setLoading(true);
-            const list = await fetchCourses();
-            const mapped: ItemView[] = list.map((m) => ({ ...m, priceWei: BigInt(m.price) }));
-            setItems(mapped);
-            setLoading(false);
+            try {
+                const res = await fetch(`${API_BASE}/api/courses`, {
+                    headers: { Accept: "application/json" },
+                });
+                const json = await res.json().catch(() => null);
+                const list: CourseMeta[] = Array.isArray(json?.items) ? json.items : [];
+                setCourses(list);
+            } catch (e) {
+                console.error(e);
+                setCourses([]);
+            } finally {
+                setLoading(false);
+            }
         })();
     }, []);
 
-    // 拉取每个 token 的 decimals/symbol & allowance
-    useEffect(() => {
-        (async () => {
-            if (!address || !ready || items.length === 0) return;
-            const signer = await getSigner();
-            const provider = signer.provider!;
-
-            const updated = await Promise.all(items.map(async (it) => {
-                const erc20 = makeContract<any>(it.tokenAddress, ERC20_MIN_ABI, provider);
-                const [dec, sym, allow] = await Promise.all([
-                    erc20.decimals(),
-                    erc20.symbol(),
-                    erc20.allowance(address, CONTRACTS.CourseRegistry.address),
-                ]);
-                return { ...it, decimals: Number(dec), symbol: sym as string, allowance: BigInt(allow) };
-            }));
-            setItems(updated);
-        })();
-    }, [address, ready, items.length]);
-
-    const approveNeeded = (it: ItemView) => {
-        if (!it.decimals) return true;
-        return (it.allowance ?? 0n) < it.priceWei;
-    };
-
-    const onApprove = async (it: ItemView) => {
-        if (!address || !ready) return;
-        setBusyId(it.courseId);
+    async function handleBuy(course: CourseMeta) {
+        if (!walletClient || !address) return;
         try {
-            const signer = await getSigner();
-            const erc20 = makeContract<any>(it.tokenAddress, ERC20_MIN_ABI, signer);
-            const tx = await erc20.approve(CONTRACTS.CourseRegistry.address, it.priceWei);
-            await tx.wait();
-            // refresh allowance
-            const allow = await erc20.allowance(address, CONTRACTS.CourseRegistry.address);
-            setItems((prev) => prev.map(p => p.courseId === it.courseId ? { ...p, allowance: BigInt(allow) } : p));
-        } finally {
-            setBusyId(null);
-        }
-    };
+            setTxStatus("准备交易…");
+            const provider = new BrowserProvider(walletClient as any);
+            const signer = await provider.getSigner();
 
-    const onBuy = async (it: ItemView) => {
-        if (!ready) return;
-        setBusyId(it.courseId);
-        try {
-            const signer = await getSigner();
-            const reg = new (await import('ethers')).Contract(
+            const price = BigInt(course.price);
+            const erc20 = new Contract(
+                CONTRACTS.PHANTOM_TOKEN.address,
+                CONTRACTS.PHANTOM_TOKEN.abi,
+                signer
+            );
+            const allowance: bigint = await erc20.allowance(
+                address,
+                CONTRACTS.CourseRegistry.address
+            );
+            if (allowance < price) {
+                setTxStatus("执行 Approve…");
+                const txApprove = await erc20.approve(
+                    CONTRACTS.CourseRegistry.address,
+                    price
+                );
+                await txApprove.wait();
+            }
+
+            const registry = new Contract(
                 CONTRACTS.CourseRegistry.address,
                 CONTRACTS.CourseRegistry.abi,
-                signer,
+                signer
             );
-            // 你的合约方法名若为 buyCourse，请把 'buy' 改成 'buyCourse'
-            const tx = await (reg as any).buy(it.courseId);
-            await tx.wait();
-            // todo: 可触发一个“购买成功”toast
-        } finally {
-            setBusyId(null);
-        }
-    };
+            setTxStatus("购买课程中…");
+            const txBuy = await registry.purchase(course.courseId);
+            await txBuy.wait();
 
-    if (loading) return <div className="text-zinc-400">Loading courses…</div>;
+            setTxStatus("购买成功 ✅，正在跳转到课程…");
+            navigate(`/course/${course.courseId}`);
+        } catch (err) {
+            console.error(err);
+            setTxStatus("交易失败 ❌");
+        }
+    }
 
     return (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {items.map((it) => {
-                const priceText = it.decimals != null
-                    ? `${weiToToken(it.priceWei, it.decimals)} ${it.symbol ?? ''}`
-                    : `${formatUnits(it.priceWei)} (loading token…)`;
+        <div>
+            <h1 className="text-2xl font-bold mb-6">可购买课程</h1>
 
-                return (
-                    <div key={it.courseId} className="rounded-2xl border border-white/10 bg-white/5 p-5 hover:border-white/20 transition">
-                        <div className="text-sm text-zinc-400">#{it.courseId}</div>
-                        <h3 className="text-lg font-semibold mt-1">{it.title}</h3>
-                        <p className="text-sm text-zinc-400 mt-2 line-clamp-2">{it.description}</p>
-                        <div className="mt-4 flex items-center justify-between">
-                            <div className="text-indigo-300 font-medium">{priceText}</div>
-                            <div className="flex gap-2">
-                                {approveNeeded(it) ? (
-                                    <button
-                                        disabled={busyId === it.courseId}
-                                        onClick={() => onApprove(it)}
-                                        className="px-3 py-2 text-sm rounded-xl bg-indigo-500/90 hover:bg-indigo-400 text-white disabled:opacity-50"
-                                    >{busyId === it.courseId ? 'Approving…' : 'Approve'}</button>
-                                ) : (
-                                    <button
-                                        disabled={busyId === it.courseId}
-                                        onClick={() => onBuy(it)}
-                                        className="px-3 py-2 text-sm rounded-xl bg-emerald-500/90 hover:bg-emerald-400 text-white disabled:opacity-50"
-                                    >{busyId === it.courseId ? 'Buying…' : 'Buy'}</button>
-                                )}
-                            </div>
+            {loading ? (
+                <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+                    {Array.from({ length: 3 }).map((_, i) => (
+                        <div key={i} className="h-40 rounded-xl border border-white/10 bg-white/[0.04] animate-pulse" />
+                    ))}
+                </div>
+            ) : courses.length > 0 ? (
+                <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+                    {courses.map((course) => (
+                        <div
+                            key={course.courseId}
+                            className="rounded-xl border border-white/10 bg-white/[0.03] p-5 shadow hover:shadow-lg hover:border-white/20 transition"
+                        >
+                            <h2 className="text-lg font-semibold">{course.title}</h2>
+                            <p className="mt-2 text-sm text-zinc-400 line-clamp-3">
+                                {course.description}
+                            </p>
+                            <p className="mt-4 text-sm text-zinc-200">
+                                价格: {formatUnits(course.price, 18)}{" "}
+                                {CONTRACTS.PHANTOM_TOKEN.symbol ?? "TOKEN"}
+                            </p>
+
+                            <button
+                                onClick={() => handleBuy(course)}
+                                className="mt-4 w-full rounded-lg bg-indigo-600 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
+                            >
+                                购买
+                            </button>
+
+                            <Link
+                                to={`/course/${course.courseId}`}
+                                className="mt-2 inline-flex text-xs text-indigo-300 hover:text-indigo-200"
+                            >
+                                查看详情 →
+                            </Link>
                         </div>
-                    </div>
-                );
-            })}
+                    ))}
+                </div>
+            ) : (
+                <div className="text-sm text-zinc-400">
+                    暂无课程可购买。你可以先到
+                    <strong className="mx-1 text-zinc-200">“我的” → “创建课程”</strong>
+                    添加一门课程。
+                </div>
+            )}
+
+            {txStatus && (
+                <div className="mt-6 p-3 rounded-lg bg-white/5 text-sm text-zinc-200">
+                    {txStatus}
+                </div>
+            )}
         </div>
     );
 }
