@@ -12,7 +12,7 @@ export function IndexRoutes() {
                 <Route index element={<Navigate to="/me" replace />} />
                 {/* 子路由：3 个页面 */}
                 <Route path="/course/:id" element={<CourseDetail />} />
-                <Route path="/buy/:id" element={<BuyCourse />} />
+                <Route path="/buy/" element={<BuyCourse />} />
                 <Route path="/me" element={<Profile />} />
                 <Route path="*" element={'页面不存在'} />
             </Route>
